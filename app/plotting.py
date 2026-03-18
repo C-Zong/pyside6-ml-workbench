@@ -20,7 +20,7 @@ def build_distribution_figure(df: pd.DataFrame, column: str) -> Figure:
         ax.set_title(f"Top values of {column}")
         ax.set_xlabel(column)
         ax.set_ylabel("Count")
-        ax.tick_params(axis="x", rotation=45)
+        ax.tick_params(axis="x", rotation=90)
 
     fig.tight_layout()
     return fig
