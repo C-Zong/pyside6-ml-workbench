@@ -14,7 +14,7 @@ def load_table(file_path: str) -> pd.DataFrame:
     """Load a table from CSV or Excel into a dataframe."""
     lower = file_path.lower()
     if lower.endswith(".csv"):
-        return pd.read_csv(file_path)
+        return pd.read_csv(file_path, low_memory=False)
     if lower.endswith((".xlsx", ".xls", ".xlsm")):
         return pd.read_excel(file_path)
     raise ValueError(f"Unsupported file type: {file_path}")
@@ -54,53 +54,25 @@ def build_column_profile(df: pd.DataFrame, column: str) -> Dict:
     }
 
 
-def clean_dataframe(
-    df: pd.DataFrame,
-    drop_duplicates: bool = True,
-    numeric_fill: str = "median",
-    categorical_fill: str = "mode",
-    trim_strings: bool = True,
-) -> pd.DataFrame:
-    """Apply the default cleaning routine to a dataframe."""
-    cleaned = df.copy()
+def replace_bad_values_with_zero(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    """Replace null-like values in selected columns with zero."""
+    if not columns:
+        raise ValueError("Please choose at least one column to zero-fill.")
 
-    if trim_strings:
-        obj_cols = cleaned.select_dtypes(include=["object", "string"]).columns
-        for col in obj_cols:
-            cleaned[col] = cleaned[col].astype("string").str.strip()
-            cleaned[col] = cleaned[col].replace({"": pd.NA, "null": pd.NA, "NULL": pd.NA, "None": pd.NA})
-
-    if drop_duplicates:
-        cleaned = cleaned.drop_duplicates()
-
-    num_cols = cleaned.select_dtypes(include=[np.number]).columns
-    cat_cols = cleaned.select_dtypes(exclude=[np.number]).columns
-
-    for col in num_cols:
-        fill_value = cleaned[col].median() if numeric_fill == "median" else cleaned[col].mean()
-        cleaned[col] = cleaned[col].fillna(fill_value)
-
-    for col in cat_cols:
-        if categorical_fill == "mode":
-            mode = cleaned[col].mode(dropna=True)
-            fill_value = mode.iloc[0] if not mode.empty else "Unknown"
-        else:
-            fill_value = "Unknown"
-        cleaned[col] = cleaned[col].fillna(fill_value)
-
-    return cleaned
-
-
-def replace_column_with_zero(df: pd.DataFrame, column: str) -> pd.DataFrame:
-    """Set an entire column to zero."""
     updated = df.copy()
-    updated[column] = 0
+    for column in columns:
+        series = updated[column]
+        stripped = series.astype("string").str.strip()
+        bad_mask = series.isna() | stripped.fillna("").eq("") | stripped.str.lower().isin(NA_TEXT_VALUES)
+        updated.loc[bad_mask, column] = 0
     return updated
 
 
-def drop_column(df: pd.DataFrame, column: str) -> pd.DataFrame:
-    """Remove a single column from a dataframe."""
-    return df.drop(columns=[column]).copy()
+def drop_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    """Remove one or more columns from a dataframe."""
+    if not columns:
+        raise ValueError("Please choose at least one column to delete.")
+    return df.drop(columns=columns).copy()
 
 
 def delete_rows_by_spec(df: pd.DataFrame, spec: str) -> pd.DataFrame:
@@ -220,6 +192,100 @@ def merge_tables(
     return pd.merge(left_df, right_df, left_on=left_key, right_on=right_key, how=how)
 
 
+def coalesce_merged_columns(
+    df: pd.DataFrame,
+    strategy: str = "first_non_empty",
+    left_key: str | None = None,
+    right_key: str | None = None,
+) -> pd.DataFrame:
+    """Collapse merged columns and optionally merge the join keys into one column."""
+    updated = df.copy()
+    suffix_pairs = _find_merge_suffix_pairs(updated.columns)
+    for base_name, left_name, right_name in suffix_pairs:
+        updated[base_name] = _coalesce_pair(updated[left_name], updated[right_name], strategy)
+        updated = updated.drop(columns=[left_name, right_name])
+    if left_key and right_key and left_key != right_key and left_key in updated.columns and right_key in updated.columns:
+        updated[left_key] = _coalesce_pair(updated[left_key], updated[right_key], strategy)
+        updated = updated.drop(columns=[right_key])
+    return updated
+
+
+def aggregate_dataset(
+    df: pd.DataFrame,
+    group_key: str,
+    specs: List[Dict[str, str]],
+) -> pd.DataFrame:
+    """Aggregate one or more value columns by key for merge-safe summaries."""
+    if not group_key:
+        raise ValueError("Please choose a Group Key.")
+    if not specs:
+        raise ValueError("Please add at least one aggregate rule.")
+
+    agg_map: Dict[str, tuple[str, str]] = {}
+    for spec in specs:
+        value_column = spec.get("value_column", "")
+        agg_function = spec.get("agg_function", "")
+        output_column = spec.get("output_column", "")
+        if not value_column or not agg_function:
+            raise ValueError("Each aggregate rule needs a Value Column and Function.")
+        if not output_column.strip():
+            raise ValueError("Each aggregate rule needs an Output Column Name.")
+        agg_map[output_column] = (value_column, agg_function)
+
+    return df.groupby(group_key, dropna=False).agg(**agg_map).reset_index()
+
+
+def convert_aggregate_column_to_binary(
+    df: pd.DataFrame,
+    source_column: str,
+    threshold: float = 0,
+    output_column: str | None = None,
+) -> pd.DataFrame:
+    """Convert one aggregate result column into a 0/1 column."""
+    if not source_column:
+        raise ValueError("Please choose a Binary Source Column.")
+
+    result_column = output_column.strip() if output_column else source_column
+    updated = df.copy()
+    numeric_values = pd.to_numeric(updated[source_column], errors="coerce").fillna(0)
+    updated[result_column] = (numeric_values > threshold).astype(int)
+    return updated
+
+
+def summarize_merge_risk(left_df: pd.DataFrame, right_df: pd.DataFrame, left_key: str, right_key: str) -> Dict[str, object]:
+    """Estimate whether a merge is likely to duplicate rows heavily."""
+    if not left_key or not right_key:
+        raise ValueError("Please choose both Left Key and Right Key.")
+
+    left_rows = len(left_df)
+    right_rows = len(right_df)
+    left_unique = int(left_df[left_key].nunique(dropna=False))
+    right_unique = int(right_df[right_key].nunique(dropna=False))
+    left_duplicates = max(left_rows - left_unique, 0)
+    right_duplicates = max(right_rows - right_unique, 0)
+    left_is_unique = left_duplicates == 0
+    right_is_unique = right_duplicates == 0
+
+    if left_is_unique and right_is_unique:
+        risk_level = "Low"
+    elif left_is_unique or right_is_unique:
+        risk_level = "Medium"
+    else:
+        risk_level = "High"
+
+    return {
+        "left_rows": left_rows,
+        "right_rows": right_rows,
+        "left_unique": left_unique,
+        "right_unique": right_unique,
+        "left_duplicates": left_duplicates,
+        "right_duplicates": right_duplicates,
+        "left_is_unique": left_is_unique,
+        "right_is_unique": right_is_unique,
+        "risk_level": risk_level,
+    }
+
+
 def infer_task_type(df: pd.DataFrame, target_col: str) -> str:
     """Infer whether a target column is classification or regression."""
     series = df[target_col]
@@ -280,3 +346,34 @@ def _split_text_by_occurrence(value: str, delimiter: str, occurrence: int) -> tu
     left = delimiter.join(parts[:occurrence])
     right = delimiter.join(parts[occurrence:])
     return left, right
+
+
+def _find_merge_suffix_pairs(columns) -> List[tuple[str, str, str]]:
+    pairs: List[tuple[str, str, str]] = []
+    column_set = set(columns)
+    for column in columns:
+        if not str(column).endswith("_x"):
+            continue
+        base_name = str(column)[:-2]
+        right_name = f"{base_name}_y"
+        if right_name in column_set:
+            pairs.append((base_name, str(column), right_name))
+    return pairs
+
+
+def _coalesce_pair(left: pd.Series, right: pd.Series, strategy: str) -> pd.Series:
+    left_missing = _is_missing_series(left)
+    right_missing = _is_missing_series(right)
+
+    if strategy == "prefer_right":
+        return right.where(~right_missing, left)
+    if strategy == "prefer_left":
+        return left.where(~left_missing, right)
+    if strategy != "first_non_empty":
+        raise ValueError(f"Unsupported coalesce strategy: {strategy}")
+    return left.where(~left_missing, right.where(~right_missing, left))
+
+
+def _is_missing_series(series: pd.Series) -> pd.Series:
+    stripped = series.astype("string").str.strip()
+    return series.isna() | stripped.fillna("").eq("") | stripped.str.lower().isin(NA_TEXT_VALUES)

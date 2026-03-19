@@ -21,8 +21,10 @@ def build_distribution_figure(df: pd.DataFrame, column: str) -> Figure:
         ax.set_xlabel(column)
         ax.set_ylabel("Count")
         ax.tick_params(axis="x", rotation=90)
+        fig.subplots_adjust(left=0.12, right=0.98, top=0.88, bottom=0.45)
+        return fig
 
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.88, bottom=0.14)
     return fig
 
 
@@ -34,5 +36,5 @@ def build_importance_figure(importance_df: pd.DataFrame) -> Figure:
     ax.set_title("Feature Importance")
     ax.set_xlabel("Importance")
     ax.set_ylabel("Feature")
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.3, right=0.96, top=0.9, bottom=0.12)
     return fig

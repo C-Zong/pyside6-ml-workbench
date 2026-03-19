@@ -24,13 +24,10 @@ class DetailPanel(QWidget):
         layout = QVBoxLayout(self)
 
         self.stack = QStackedWidget()
-        self.clean_page = self._build_clean_page()
-        self.merge_page = self._build_merge_page()
-        self.train_page = self._build_train_page()
-
-        self.stack.addWidget(self.clean_page)
-        self.stack.addWidget(self.merge_page)
-        self.stack.addWidget(self.train_page)
+        self.stack.addWidget(self._build_clean_page())
+        self.stack.addWidget(self._build_aggregate_page())
+        self.stack.addWidget(self._build_merge_page())
+        self.stack.addWidget(self._build_train_page())
         layout.addWidget(self.stack)
 
     def _build_clean_page(self) -> QWidget:
@@ -52,9 +49,7 @@ class DetailPanel(QWidget):
         self.export_btn = QPushButton("Export")
         header.addWidget(self.export_btn)
         layout.addLayout(header)
-        self.clean_table = QTableView()
-        self.clean_model = DataFrameTableModel()
-        self.clean_table.setModel(self.clean_model)
+        self.clean_table, self.clean_model = self._build_table_view()
         layout.addWidget(self.clean_table)
         return page
 
@@ -74,14 +69,10 @@ class DetailPanel(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(QLabel("Head Preview"))
-        self.process_head_table = QTableView()
-        self.process_head_model = DataFrameTableModel()
-        self.process_head_table.setModel(self.process_head_model)
+        self.process_head_table, self.process_head_model = self._build_table_view()
         layout.addWidget(self.process_head_table)
         layout.addWidget(QLabel("Tail Preview"))
-        self.process_tail_table = QTableView()
-        self.process_tail_model = DataFrameTableModel()
-        self.process_tail_table.setModel(self.process_tail_model)
+        self.process_tail_table, self.process_tail_model = self._build_table_view()
         layout.addWidget(self.process_tail_table)
         return page
 
@@ -89,28 +80,33 @@ class DetailPanel(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addWidget(QLabel("Merged Dataset Preview"))
-        self.merge_table = QTableView()
-        self.merge_model = DataFrameTableModel()
-        self.merge_table.setModel(self.merge_model)
+        self.merge_table, self.merge_model = self._build_table_view()
         layout.addWidget(self.merge_table)
+        return page
+
+    def _build_aggregate_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel("Aggregated Dataset Preview"))
+        self.aggregate_table, self.aggregate_model = self._build_table_view()
+        layout.addWidget(self.aggregate_table)
         return page
 
     def _build_train_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-
         layout.addWidget(QLabel("Training Metrics"))
         self.train_metrics = QTextEdit()
         self.train_metrics.setReadOnly(True)
         layout.addWidget(self.train_metrics)
 
-        self.train_figure_container = QWidget()
-        train_figure_container_layout = QVBoxLayout(self.train_figure_container)
-        train_figure_container_layout.addWidget(QLabel("Feature Importance"))
+        figure_section = QWidget()
+        figure_layout = QVBoxLayout(figure_section)
+        figure_layout.addWidget(QLabel("Feature Importance"))
         self.train_figure_host = QWidget()
         self.train_figure_layout = QVBoxLayout(self.train_figure_host)
-        train_figure_container_layout.addWidget(self.train_figure_host)
-        layout.addWidget(self.train_figure_container)
+        figure_layout.addWidget(self.train_figure_host)
+        layout.addWidget(figure_section)
         return page
 
     def set_current_page(self, index: int) -> None:
@@ -122,6 +118,7 @@ class DetailPanel(QWidget):
         self.clean_model.set_dataframe(df.head(300))
         self.process_head_model.set_dataframe(df.head(10))
         self.process_tail_model.set_dataframe(df.tail(10))
+        self.aggregate_model.set_dataframe(df.head(300))
         self.merge_model.set_dataframe(df.head(300))
 
     def update_clean_figure(self, figure) -> None:
@@ -134,6 +131,7 @@ class DetailPanel(QWidget):
         self._replace_figure(self.train_figure_layout, figure)
 
     def _replace_figure(self, layout, figure) -> None:
+        # Recreate the canvas so each refresh owns the latest matplotlib figure.
         while layout.count():
             item = layout.takeAt(0)
             widget = item.widget()
@@ -146,3 +144,9 @@ class DetailPanel(QWidget):
         canvas = FigureCanvas(figure)
         canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         layout.addWidget(canvas)
+
+    def _build_table_view(self) -> tuple[QTableView, DataFrameTableModel]:
+        table = QTableView()
+        model = DataFrameTableModel()
+        table.setModel(model)
+        return table, model

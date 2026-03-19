@@ -14,6 +14,8 @@ class AppState:
     active_dataset_name: Optional[str] = None
     # Mutable dataframe used by clean/process/train workflows.
     working_df: Optional[pd.DataFrame] = None
+    # Column currently selected in the clean workflow.
+    clean_column: Optional[str] = None
     # Columns selected as model input features.
     feature_columns: List[str] = field(default_factory=list)
     # Column selected as the prediction target.
@@ -26,6 +28,10 @@ class AppState:
     metrics: Dict[str, float] = field(default_factory=dict)
     # Feature-importance table produced by the trained model.
     feature_importance: Optional[pd.DataFrame] = None
+    # Loaded and trained model entries keyed by display name.
+    trained_models: Dict[str, dict] = field(default_factory=dict)
+    # Name of the model currently selected in the left panel.
+    active_model_name: Optional[str] = None
     # Trained pipeline or estimator object.
     trained_model: Optional[object] = None
     # Stored incremental model state for true continuation.

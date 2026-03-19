@@ -18,6 +18,16 @@ venv/
 # Build / packaging
 build/
 dist/
+*.spec
+*.exe
+*.pkl
+
+# Local data
+data/
+*.csv
+*.xlsx
+*.xls
+*.xlsm
 
 # Logs
 *.log

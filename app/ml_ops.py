@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-from .data_ops import split_feature_types
+from .data_ops import NA_TEXT_VALUES, split_feature_types
 from .models import get_model, is_incremental_model
 
 
@@ -71,6 +71,7 @@ def train_model(
     model_name: str,
     task_type: str,
     continue_bundle: IncrementalModelBundle | None = None,
+    model_params: Dict | None = None,
     test_size: float = 0.2,
     random_state: int = 42,
 ) -> TrainingResult:
@@ -79,8 +80,19 @@ def train_model(
         return _continue_incremental_model(continue_bundle, train_df, eval_df, features, target)
 
     if is_incremental_model(model_name):
-        return _fit_incremental_model(train_df, eval_df, features, target, model_name, task_type, test_size, random_state)
-    return _fit_full_model(train_df, eval_df, features, target, model_name, task_type, test_size, random_state)
+        return _fit_incremental_model(train_df, eval_df, features, target, model_name, task_type, model_params or {}, test_size, random_state)
+    return _fit_full_model(train_df, eval_df, features, target, model_name, task_type, model_params or {}, test_size, random_state)
+
+
+def predict_dataframe(model_or_bundle, df: pd.DataFrame, features: List[str]) -> pd.Series:
+    """Run predictions on a dataframe using the stored training features."""
+    feature_frame = _normalize_feature_frame(df[features].copy())
+    if hasattr(model_or_bundle, "named_steps"):
+        return pd.Series(model_or_bundle.predict(feature_frame), index=df.index)
+    if hasattr(model_or_bundle, "preprocessor") and hasattr(model_or_bundle, "model"):
+        transformed = model_or_bundle.preprocessor.transform(feature_frame)
+        return pd.Series(model_or_bundle.model.predict(transformed), index=df.index)
+    raise ValueError("Loaded model format is not supported for prediction.")
 
 
 def extract_importance(model_or_pipeline, df: pd.DataFrame, features: List[str], preprocessor: ColumnTransformer | None = None) -> pd.DataFrame:
@@ -110,15 +122,15 @@ def compute_feature_names(preprocessor: ColumnTransformer, numeric_features: Lis
     return feature_names
 
 
-def _fit_full_model(train_df, eval_df, features, target, model_name, task_type, test_size, random_state) -> TrainingResult:
-    dataset = train_df[features + [target]].dropna().copy()
+def _fit_full_model(train_df, eval_df, features, target, model_name, task_type, model_params, test_size, random_state) -> TrainingResult:
+    dataset = _prepare_training_frame(train_df, features, target)
     if dataset.empty:
-        raise ValueError("Training dataset is empty after dropping missing target rows.")
+        raise ValueError("Training dataset is empty after preparing target and feature values.")
 
     if eval_df is None or eval_df.empty:
         X = dataset[features]
         y = dataset[target]
-        stratify = y if task_type == "classification" and y.nunique(dropna=True) > 1 else None
+        stratify = _build_stratify_target(y, task_type, test_size)
         X_train, X_eval, y_train, y_eval = train_test_split(
             X,
             y,
@@ -130,12 +142,12 @@ def _fit_full_model(train_df, eval_df, features, target, model_name, task_type, 
         eval_frame = pd.concat([X_eval, y_eval], axis=1)
     else:
         train_frame = dataset
-        eval_frame = eval_df[features + [target]].dropna().copy()
+        eval_frame = _prepare_training_frame(eval_df, features, target)
         if eval_frame.empty:
             raise ValueError("Evaluation dataset is empty after filtering by time range.")
 
     preprocessor = build_preprocessor(train_frame, features)
-    model = get_model(model_name, task_type)
+    model = get_model(model_name, task_type, model_params=model_params)
     pipeline = Pipeline(steps=[("preprocessor", preprocessor), ("model", model)])
     pipeline.fit(train_frame[features], train_frame[target])
     preds = pipeline.predict(eval_frame[features])
@@ -145,15 +157,15 @@ def _fit_full_model(train_df, eval_df, features, target, model_name, task_type, 
     return TrainingResult(pipeline, metrics, importance_df)
 
 
-def _fit_incremental_model(train_df, eval_df, features, target, model_name, task_type, test_size, random_state) -> TrainingResult:
-    dataset = train_df[features + [target]].dropna().copy()
+def _fit_incremental_model(train_df, eval_df, features, target, model_name, task_type, model_params, test_size, random_state) -> TrainingResult:
+    dataset = _prepare_training_frame(train_df, features, target)
     if dataset.empty:
-        raise ValueError("Training dataset is empty after dropping missing target rows.")
+        raise ValueError("Training dataset is empty after preparing target and feature values.")
 
     if eval_df is None or eval_df.empty:
         X = dataset[features]
         y = dataset[target]
-        stratify = y if task_type == "classification" and y.nunique(dropna=True) > 1 else None
+        stratify = _build_stratify_target(y, task_type, test_size)
         X_train, X_eval, y_train, y_eval = train_test_split(
             X,
             y,
@@ -165,14 +177,14 @@ def _fit_incremental_model(train_df, eval_df, features, target, model_name, task
         eval_frame = pd.concat([X_eval, y_eval], axis=1)
     else:
         train_frame = dataset
-        eval_frame = eval_df[features + [target]].dropna().copy()
+        eval_frame = _prepare_training_frame(eval_df, features, target)
         if eval_frame.empty:
             raise ValueError("Evaluation dataset is empty after filtering by time range.")
 
     preprocessor = build_preprocessor(train_frame, features)
     X_train = preprocessor.fit_transform(train_frame[features])
     X_eval = preprocessor.transform(eval_frame[features])
-    model = get_model(model_name, task_type)
+    model = get_model(model_name, task_type, model_params=model_params)
 
     if task_type == "classification":
         model.partial_fit(X_train, train_frame[target], classes=np.unique(train_frame[target]))
@@ -187,14 +199,14 @@ def _fit_incremental_model(train_df, eval_df, features, target, model_name, task
 
 
 def _continue_incremental_model(bundle: IncrementalModelBundle, train_df: pd.DataFrame, eval_df: pd.DataFrame | None, features, target) -> TrainingResult:
-    train_frame = train_df[features + [target]].dropna().copy()
+    train_frame = _prepare_training_frame(train_df, features, target)
     if train_frame.empty:
-        raise ValueError("Training dataset is empty after dropping missing target rows.")
+        raise ValueError("Training dataset is empty after preparing target and feature values.")
 
     if eval_df is None or eval_df.empty:
         eval_frame = train_frame
     else:
-        eval_frame = eval_df[features + [target]].dropna().copy()
+        eval_frame = _prepare_training_frame(eval_df, features, target)
         if eval_frame.empty:
             raise ValueError("Evaluation dataset is empty after filtering by time range.")
 
@@ -222,6 +234,48 @@ def _compute_metrics(y_true, y_pred, task_type: str) -> Dict[str, float]:
         }
     return {
         "mae": float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(mean_squared_error(y_true, y_pred, squared=False)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
         "r2": float(r2_score(y_true, y_pred)),
     }
+
+
+def _prepare_training_frame(df: pd.DataFrame, features: List[str], target: str) -> pd.DataFrame:
+    frame = df[features + [target]].copy()
+    frame[features] = _normalize_feature_frame(frame[features])
+    frame[target] = _normalize_target_series(frame[target])
+    frame = frame.dropna(subset=[target]).reset_index(drop=True)
+    return frame
+
+
+def _normalize_feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    for column in normalized.columns:
+        series = normalized[column]
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            stripped = series.astype("string").str.strip()
+            normalized[column] = series.mask(stripped.fillna("").eq("") | stripped.str.lower().isin(NA_TEXT_VALUES), pd.NA)
+    return normalized
+
+
+def _normalize_target_series(series: pd.Series) -> pd.Series:
+    normalized = series.copy()
+    if pd.api.types.is_object_dtype(normalized) or pd.api.types.is_string_dtype(normalized):
+        stripped = normalized.astype("string").str.strip()
+        normalized = normalized.mask(stripped.fillna("").eq("") | stripped.str.lower().isin(NA_TEXT_VALUES), pd.NA)
+    return normalized.fillna(0)
+
+
+def _build_stratify_target(y: pd.Series, task_type: str, test_size: float):
+    if task_type != "classification":
+        return None
+
+    value_counts = y.value_counts(dropna=False)
+    class_count = len(value_counts)
+    if class_count < 2 or value_counts.min() < 2:
+        return None
+
+    test_rows = max(int(round(len(y) * test_size)), 1)
+    train_rows = len(y) - test_rows
+    if test_rows < class_count or train_rows < class_count:
+        return None
+    return y

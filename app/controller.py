@@ -1,26 +1,28 @@
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
+import pandas as pd
 from PySide6.QtCore import QObject, QThread, Signal
 
 from .data_ops import (
     build_column_profile,
-    clean_dataframe,
     create_formatted_column,
     create_time_range_dataset,
     delete_rows_by_spec,
     drop_bad_rows,
-    drop_column,
+    drop_columns,
     infer_task_type,
-    merge_tables,
-    replace_column_with_zero,
+    replace_bad_values_with_zero,
     save_table,
+    summarize_merge_risk,
     split_column_by_delimiter_occurrence,
 )
 from .models import get_model_options, is_incremental_model
+from .ml_ops import predict_dataframe
 from .plotting import build_distribution_figure, build_importance_figure
 from .state import AppState
-from .worker import LoadWorker, TrainWorker
+from .worker import AggregateWorker, LoadWorker, MergeWorker, TrainWorker
 
 
 class AppController(QObject):
@@ -34,10 +36,14 @@ class AppController(QObject):
     model_options_changed = Signal(list)
     training_results_changed = Signal(str, object)
     load_button_enabled = Signal(bool)
+    aggregate_button_enabled = Signal(bool)
+    merge_button_enabled = Signal(bool)
     train_button_enabled = Signal(bool)
     status_changed = Signal(str)
     error_occurred = Signal(str, str)
     trained_model_changed = Signal(str)
+    trained_models_changed = Signal(list, str)
+    merge_risk_changed = Signal(str)
 
     def __init__(self, state: AppState | None = None) -> None:
         super().__init__()
@@ -46,6 +52,10 @@ class AppController(QObject):
         self.load_workers: dict[QThread, LoadWorker] = {}
         self.train_thread: QThread | None = None
         self.train_worker: TrainWorker | None = None
+        self.aggregate_thread: QThread | None = None
+        self.aggregate_worker: AggregateWorker | None = None
+        self.merge_thread: QThread | None = None
+        self.merge_worker: MergeWorker | None = None
 
     def load_files(self, files: list[str]) -> None:
         """Load datasets in parallel background threads."""
@@ -77,20 +87,192 @@ class AppController(QObject):
         if dataset_name not in self.state.dataframes:
             return
 
-        self.state.active_dataset_name = dataset_name
-        self.state.working_df = self.state.dataframes[dataset_name].copy()
-        self._emit_working_df()
+        self._activate_dataset(dataset_name, self.state.dataframes[dataset_name])
         self.status_changed.emit(f"Selected dataset: {dataset_name}")
 
-    def clean_current_dataset(self) -> None:
-        """Run the default dataframe cleaning pipeline on the working dataset."""
+    def delete_dataset(self, dataset_name: str) -> None:
+        """Delete one loaded dataset and select a replacement when needed."""
+        if dataset_name not in self.state.dataframes:
+            return
+
+        del self.state.dataframes[dataset_name]
+        if self.state.active_dataset_name == dataset_name:
+            remaining_names = list(self.state.dataframes.keys())
+            if remaining_names:
+                next_name = remaining_names[0]
+                self._activate_dataset(next_name, self.state.dataframes[next_name])
+            else:
+                self.state.active_dataset_name = None
+                self._set_working_df(pd.DataFrame())
+        self._emit_datasets()
+        self.status_changed.emit(f"Deleted dataset: {dataset_name}")
+
+    def export_dataset(self, dataset_name: str, file_path: str) -> None:
+        """Export one loaded dataset by name."""
+        df = self.state.dataframes.get(dataset_name)
+        if df is None:
+            self.error_occurred.emit("Export error", "Selected dataset no longer exists.")
+            return
+
+        try:
+            save_table(df, file_path)
+        except Exception as exc:
+            self.error_occurred.emit("Export error", str(exc))
+            return
+
+        self.status_changed.emit(f"Exported dataset to {file_path}")
+
+    def export_trained_model(self, file_path: str, model_name: str | None = None) -> None:
+        """Export the stored trained model bundle or pipeline."""
+        entry = self._get_model_entry(model_name)
+        if entry is None:
+            self.error_occurred.emit("Export error", "No trained model is available.")
+            return
+
+        try:
+            with open(file_path, "wb") as handle:
+                pickle.dump(
+                    {
+                        "trained_model": entry["trained_model"],
+                        "feature_columns": list(entry.get("feature_columns") or []),
+                        "target_column": entry.get("target_column"),
+                        "selected_model_name": entry.get("selected_model_name"),
+                        "task_type": entry.get("task_type"),
+                        "metrics": dict(entry.get("metrics") or {}),
+                        "feature_importance": entry.get("feature_importance"),
+                    },
+                    handle,
+                )
+        except Exception as exc:
+            self.error_occurred.emit("Export error", str(exc))
+            return
+
+        self.status_changed.emit(f"Exported trained model to {file_path}")
+
+    def load_trained_model(self, file_path: str) -> None:
+        """Load one previously exported model file."""
+        try:
+            with open(file_path, "rb") as handle:
+                payload = pickle.load(handle)
+        except Exception as exc:
+            self.error_occurred.emit("Load model error", str(exc))
+            return
+
+        if isinstance(payload, dict) and "trained_model" in payload:
+            entry = {
+                "trained_model": payload.get("trained_model"),
+                "feature_columns": list(payload.get("feature_columns") or []),
+                "target_column": payload.get("target_column"),
+                "selected_model_name": payload.get("selected_model_name") or "Loaded Model",
+                "task_type": payload.get("task_type") or self.state.task_type,
+                "metrics": dict(payload.get("metrics") or {}),
+                "feature_importance": payload.get("feature_importance"),
+                "incremental_model_bundle": None,
+                "incremental_features": [],
+                "incremental_target": None,
+                "incremental_model_name": None,
+                "incremental_task_type": None,
+            }
+        else:
+            entry = {
+                "trained_model": payload,
+                "feature_columns": [],
+                "target_column": None,
+                "selected_model_name": "Loaded Model",
+                "task_type": self.state.task_type,
+                "metrics": {},
+                "feature_importance": None,
+                "incremental_model_bundle": None,
+                "incremental_features": [],
+                "incremental_target": None,
+                "incremental_model_name": None,
+                "incremental_task_type": None,
+            }
+
+        model_name = self._build_model_entry_name(Path(file_path).stem)
+        self.state.trained_models[model_name] = entry
+        self.select_trained_model(model_name)
+        self.status_changed.emit(f"Loaded model: {Path(file_path).name}")
+
+    def select_trained_model(self, model_name: str) -> None:
+        """Activate one model entry from the left-side model list."""
+        if model_name == self.state.active_model_name:
+            return
+
+        entry = self.state.trained_models.get(model_name)
+        if entry is None:
+            return
+
+        self.state.active_model_name = model_name
+        self.state.trained_model = entry.get("trained_model")
+        self.state.feature_columns = list(entry.get("feature_columns") or [])
+        self.state.target_column = entry.get("target_column")
+        self.state.selected_model_name = entry.get("selected_model_name") or self.state.selected_model_name
+        self.state.task_type = entry.get("task_type") or self.state.task_type
+        self.state.metrics = dict(entry.get("metrics") or {})
+        self.state.feature_importance = entry.get("feature_importance")
+        self.state.incremental_model_bundle = entry.get("incremental_model_bundle")
+        self.state.incremental_features = list(entry.get("incremental_features") or [])
+        self.state.incremental_target = entry.get("incremental_target")
+        self.state.incremental_model_name = entry.get("incremental_model_name")
+        self.state.incremental_task_type = entry.get("incremental_task_type")
+
+        figure = build_importance_figure(self.state.feature_importance) if self.state.feature_importance is not None and not self.state.feature_importance.empty else None
+        metrics_text = ""
+        if self.state.metrics:
+            metrics_text = "Training complete\n" + "\n".join(f"{key}: {value:.4f}" for key, value in self.state.metrics.items())
+        self.training_results_changed.emit(metrics_text, figure)
+        self._emit_trained_models()
+
+    def delete_trained_model(self, model_name: str) -> None:
+        """Delete one saved model entry."""
+        if model_name not in self.state.trained_models:
+            return
+
+        del self.state.trained_models[model_name]
+        if self.state.active_model_name == model_name:
+            remaining = list(self.state.trained_models.keys())
+            if remaining:
+                self.select_trained_model(remaining[0])
+            else:
+                self.state.active_model_name = None
+                self._clear_active_model_state()
+                self.training_results_changed.emit("", None)
+                self._emit_trained_models()
+        else:
+            self._emit_trained_models()
+        self.status_changed.emit(f"Deleted model: {model_name}")
+
+    def predict_current_dataset(self) -> None:
+        """Generate predictions for the active dataset and save them as a new dataset."""
         df = self._require_working_df()
         if df is None:
             return
+        if self.state.trained_model is None:
+            self.error_occurred.emit("Predict error", "Please train or load a model first.")
+            return
+        if not self.state.feature_columns:
+            self.error_occurred.emit("Predict error", "This model does not have saved feature metadata.")
+            return
 
-        self.state.working_df = clean_dataframe(df)
-        self._emit_working_df()
-        self.status_changed.emit("Applied default cleaning.")
+        missing = [feature for feature in self.state.feature_columns if feature not in df.columns]
+        if missing:
+            self.error_occurred.emit("Predict error", f"Missing feature columns: {', '.join(missing[:5])}")
+            return
+
+        try:
+            predictions = predict_dataframe(self.state.trained_model, df, self.state.feature_columns)
+        except Exception as exc:
+            self.error_occurred.emit("Predict error", str(exc))
+            return
+
+        predicted_df = df.copy()
+        prediction_column = f"{self.state.target_column or 'Prediction'} Prediction"
+        predicted_df[prediction_column] = predictions
+        result_name = self._build_prediction_result_name()
+        self.state.dataframes[result_name] = predicted_df
+        self._activate_dataset(result_name, predicted_df, emit_datasets=True)
+        self.status_changed.emit(f"Created prediction dataset: {result_name}")
 
     def update_clean_column(self, column: str) -> None:
         """Refresh the clean-tab profile for a selected column."""
@@ -98,6 +280,7 @@ class AppController(QObject):
         if df is None or not column:
             return
 
+        self.state.clean_column = column
         profile = build_column_profile(df, column)
         profile_lines = [
             f"Column: {profile['column']}",
@@ -113,28 +296,43 @@ class AppController(QObject):
         self.clean_profile_changed.emit("\n".join(profile_lines))
         self.clean_figure_changed.emit(build_distribution_figure(df, column))
 
-    def drop_selected_column(self, column: str) -> None:
-        """Delete the chosen column from the working dataframe."""
+    def drop_selected_columns(self, columns: list[str]) -> None:
+        """Delete the chosen columns from the working dataframe."""
         df = self._require_working_df()
-        if df is None or not column:
+        if df is None or not columns:
             return
 
-        self.state.working_df = drop_column(df, column)
-        self._emit_working_df()
-        self.clean_profile_changed.emit("")
-        self.clean_figure_changed.emit(None)
-        self.status_changed.emit(f"Deleted column: {column}")
-
-    def zero_selected_column(self, column: str) -> None:
-        """Replace all values in the chosen column with zero."""
-        df = self._require_working_df()
-        if df is None or not column:
+        try:
+            updated_df = drop_columns(df, columns)
+        except Exception as exc:
+            self.error_occurred.emit("Process error", str(exc))
             return
 
-        self.state.working_df = replace_column_with_zero(df, column)
-        self._emit_working_df()
-        self.update_clean_column(column)
-        self.status_changed.emit(f"Set column to zero: {column}")
+        self._set_working_df(updated_df)
+        current_column = self.state.clean_column
+        if current_column in columns:
+            self.state.clean_column = None
+            self.clean_profile_changed.emit("")
+            self.clean_figure_changed.emit(None)
+        elif current_column:
+            self.update_clean_column(current_column)
+        self.status_changed.emit(f"Deleted columns: {', '.join(columns)}")
+
+    def zero_fill_bad_values(self, columns: list[str]) -> None:
+        """Replace null-like values with zero in the selected columns."""
+        df = self._require_working_df()
+        if df is None or not columns:
+            return
+
+        try:
+            updated_df = replace_bad_values_with_zero(df, columns)
+        except Exception as exc:
+            self.error_occurred.emit("Process error", str(exc))
+            return
+
+        self._set_working_df(updated_df, status_message=f"Zero-filled bad values in: {', '.join(columns)}")
+        if self.state.clean_column in columns:
+            self.update_clean_column(self.state.clean_column)
 
     def export_current_dataset(self, file_path: str) -> None:
         """Export the current working dataframe."""
@@ -157,13 +355,12 @@ class AppController(QObject):
             return
 
         try:
-            self.state.working_df = delete_rows_by_spec(df, spec)
+            updated_df = delete_rows_by_spec(df, spec)
         except Exception as exc:
             self.error_occurred.emit("Process error", str(exc))
             return
 
-        self._emit_working_df()
-        self.status_changed.emit("Deleted selected rows.")
+        self._set_working_df(updated_df, status_message="Deleted selected rows.")
 
     def delete_bad_rows(self, columns: list[str], threshold: float) -> None:
         """Delete rows with a high ratio of NA/0/empty values."""
@@ -173,13 +370,12 @@ class AppController(QObject):
 
         try:
             target_columns = columns or list(df.columns)
-            self.state.working_df = drop_bad_rows(df, target_columns, threshold)
+            updated_df = drop_bad_rows(df, target_columns, threshold)
         except Exception as exc:
             self.error_occurred.emit("Process error", str(exc))
             return
 
-        self._emit_working_df()
-        self.status_changed.emit("Removed rows with high bad-value ratios.")
+        self._set_working_df(updated_df, status_message="Removed rows with high bad-value ratios.")
 
     def create_range_dataset(
         self,
@@ -201,10 +397,7 @@ class AppController(QObject):
 
         result_name = self._build_range_dataset_name(dataset_name, time_column, start_text, end_text)
         self.state.dataframes[result_name] = ranged_df
-        self.state.active_dataset_name = result_name
-        self.state.working_df = ranged_df.copy()
-        self._emit_datasets()
-        self._emit_working_df()
+        self._activate_dataset(result_name, ranged_df, emit_datasets=True)
         self.status_changed.emit(f"Created range dataset: {result_name}")
 
     def create_column(
@@ -222,7 +415,7 @@ class AppController(QObject):
             return
 
         try:
-            self.state.working_df = create_formatted_column(
+            updated_df = create_formatted_column(
                 df,
                 new_column=new_column,
                 left_column=left_column,
@@ -235,8 +428,7 @@ class AppController(QObject):
             self.error_occurred.emit("Process error", str(exc))
             return
 
-        self._emit_working_df()
-        self.status_changed.emit(f"Created column: {new_column}")
+        self._set_working_df(updated_df, status_message=f"Created column: {new_column}")
 
     def split_column_by_delimiter(
         self,
@@ -252,7 +444,7 @@ class AppController(QObject):
             return
 
         try:
-            self.state.working_df = split_column_by_delimiter_occurrence(
+            updated_df = split_column_by_delimiter_occurrence(
                 df,
                 source_column=source_column,
                 left_new_column=left_new_column,
@@ -264,8 +456,7 @@ class AppController(QObject):
             self.error_occurred.emit("Column split error", str(exc))
             return
 
-        self._emit_working_df()
-        self.status_changed.emit(f"Split column by delimiter: {source_column}")
+        self._set_working_df(updated_df, status_message=f"Split column by delimiter: {source_column}")
 
     def merge_datasets(
         self,
@@ -274,39 +465,128 @@ class AppController(QObject):
         left_key: str,
         right_key: str,
         join_type: str,
+        aggregate_right: bool = False,
+        aggregate_specs: list[dict] | None = None,
+        coalesce_columns: bool = False,
+        coalesce_strategy: str = "first_non_empty",
     ) -> None:
         """Merge or append two loaded datasets and register the result as a new dataset."""
         if left_name not in self.state.dataframes or right_name not in self.state.dataframes:
             self.error_occurred.emit("Merge error", "Please choose two valid datasets.")
             return
-
-        try:
-            merged = merge_tables(
-                self.state.dataframes[left_name],
-                self.state.dataframes[right_name],
-                left_key=left_key,
-                right_key=right_key,
-                how=join_type,
-            )
-        except Exception as exc:
-            self.error_occurred.emit("Merge error", str(exc))
+        aggregate_specs = aggregate_specs or []
+        if aggregate_right and not aggregate_specs:
+            self.error_occurred.emit("Merge error", "Please add at least one Aggregate Rule.")
             return
 
+        self.merge_button_enabled.emit(False)
+        self.status_changed.emit("Merge started...")
         result_name = self._build_result_name(left_name, right_name, join_type)
-        self.state.dataframes[result_name] = merged
-        self.state.active_dataset_name = result_name
-        self.state.working_df = merged.copy()
-        self._emit_datasets()
-        self._emit_working_df()
-        self.status_changed.emit(f"Created merged dataset: {result_name}")
 
-    def update_target(self, target: str) -> None:
-        """Infer task type for the selected target and refresh model options."""
+        self.merge_thread = QThread()
+        self.merge_worker = MergeWorker(
+            left_df=self.state.dataframes[left_name].copy(),
+            right_df=self.state.dataframes[right_name].copy(),
+            left_key=left_key,
+            right_key=right_key,
+            join_type=join_type,
+            aggregate_right=aggregate_right,
+            aggregate_specs=aggregate_specs,
+            coalesce_columns=coalesce_columns,
+            coalesce_strategy=coalesce_strategy,
+        )
+        self.merge_worker.moveToThread(self.merge_thread)
+        self.merge_thread.started.connect(self.merge_worker.run)
+        self.merge_worker.finished.connect(lambda merged_df, name=result_name: self._on_merge_finished(name, merged_df))
+        self.merge_worker.error.connect(self._on_merge_error)
+        self.merge_worker.finished.connect(self.merge_thread.quit)
+        self.merge_worker.error.connect(self.merge_thread.quit)
+        self.merge_thread.finished.connect(self.merge_thread.deleteLater)
+        self.merge_thread.finished.connect(self._clear_merge_thread)
+        self.merge_thread.start()
+
+    def create_aggregated_dataset(
+        self,
+        dataset_name: str,
+        group_key: str,
+        specs: list[dict],
+        output_name: str,
+        binary_config: dict | None = None,
+    ) -> None:
+        """Aggregate one dataset into a new grouped dataset."""
+        if dataset_name not in self.state.dataframes:
+            self.error_occurred.emit("Aggregate error", "Please choose a valid dataset.")
+            return
+        if not specs:
+            self.error_occurred.emit("Aggregate error", "Please add at least one Aggregate Rule.")
+            return
+        if binary_config:
+            aggregate_columns = {spec.get("output_column", "").strip() for spec in specs}
+            if binary_config["source_column"] not in aggregate_columns:
+                self.error_occurred.emit("Aggregate error", "Binary Source Column must match an Aggregate Rule output.")
+                return
+
+        result_name = self._build_aggregate_result_name(dataset_name, output_name)
+        self.aggregate_button_enabled.emit(False)
+        self.status_changed.emit("Aggregation started...")
+
+        self.aggregate_thread = QThread()
+        self.aggregate_worker = AggregateWorker(
+            df=self.state.dataframes[dataset_name].copy(),
+            group_key=group_key,
+            specs=specs,
+            binary_config=binary_config,
+        )
+        self.aggregate_worker.moveToThread(self.aggregate_thread)
+        self.aggregate_thread.started.connect(self.aggregate_worker.run)
+        self.aggregate_worker.finished.connect(lambda aggregated_df, name=result_name: self._on_aggregate_finished(name, aggregated_df))
+        self.aggregate_worker.error.connect(self._on_aggregate_error)
+        self.aggregate_worker.finished.connect(self.aggregate_thread.quit)
+        self.aggregate_worker.error.connect(self.aggregate_thread.quit)
+        self.aggregate_thread.finished.connect(self.aggregate_thread.deleteLater)
+        self.aggregate_thread.finished.connect(self._clear_aggregate_thread)
+        self.aggregate_thread.start()
+
+    def update_merge_risk(self, left_name: str, right_name: str, left_key: str, right_key: str) -> None:
+        """Compute a quick merge-risk summary for the selected keys."""
+        if left_name not in self.state.dataframes or right_name not in self.state.dataframes:
+            self.merge_risk_changed.emit("")
+            return
+        if not left_key or not right_key:
+            self.merge_risk_changed.emit("")
+            return
+
+        try:
+            risk = summarize_merge_risk(
+                self.state.dataframes[left_name],
+                self.state.dataframes[right_name],
+                left_key,
+                right_key,
+            )
+        except Exception:
+            self.merge_risk_changed.emit("")
+            return
+
+        lines = [
+            f"Risk Level: {risk['risk_level']}",
+            f"Left Rows: {risk['left_rows']}",
+            f"Right Rows: {risk['right_rows']}",
+            f"Left Unique Keys: {risk['left_unique']}",
+            f"Right Unique Keys: {risk['right_unique']}",
+            f"Left Duplicate Keys: {risk['left_duplicates']}",
+            f"Right Duplicate Keys: {risk['right_duplicates']}",
+        ]
+        if risk["risk_level"] == "High":
+            lines.append("Warning: both sides have duplicate keys, so merge size may explode.")
+        self.merge_risk_changed.emit("\n".join(lines))
+
+    def update_target(self, target: str, task_type_override: str | None = None) -> None:
+        """Resolve task type for the selected target and refresh model options."""
         df = self._require_working_df()
         if df is None or not target:
             return
 
-        self.state.task_type = infer_task_type(df, target)
+        self.state.task_type = task_type_override or infer_task_type(df, target)
         self.model_options_changed.emit(get_model_options(self.state.task_type))
 
     def train_model(
@@ -314,6 +594,7 @@ class AppController(QObject):
         target: str,
         features: list[str],
         model_name: str,
+        model_params: dict | None = None,
         continue_training: bool = False,
     ) -> None:
         """Start model training on the current working dataset."""
@@ -346,6 +627,7 @@ class AppController(QObject):
             model_name=model_name,
             task_type=self.state.task_type,
             continue_bundle=self.state.incremental_model_bundle if continue_training else None,
+            model_params=model_params or {},
         )
         self.train_worker.moveToThread(self.train_thread)
         self.train_thread.started.connect(self.train_worker.run)
@@ -354,6 +636,7 @@ class AppController(QObject):
         self.train_worker.finished.connect(self.train_thread.quit)
         self.train_worker.error.connect(self.train_thread.quit)
         self.train_thread.finished.connect(self.train_thread.deleteLater)
+        self.train_thread.finished.connect(self._clear_train_thread)
         self.train_thread.start()
 
     def _require_working_df(self):
@@ -374,9 +657,7 @@ class AppController(QObject):
     def _on_load_finished(self, file_name: str, df) -> None:
         self.state.dataframes[file_name] = df
         if self.state.active_dataset_name is None:
-            self.state.active_dataset_name = file_name
-            self.state.working_df = df.copy()
-            self._emit_working_df()
+            self._activate_dataset(file_name, df)
         self._emit_datasets()
 
     def _on_load_error(self, file_name: str, message: str) -> None:
@@ -391,8 +672,6 @@ class AppController(QObject):
 
     def _on_train_finished(self, result) -> None:
         self.train_button_enabled.emit(True)
-        self.train_worker = None
-        self.train_thread = None
 
         self.state.trained_model = result.pipeline if result.pipeline is not None else result.model_bundle
         self.state.metrics = result.metrics
@@ -410,27 +689,64 @@ class AppController(QObject):
             self.state.incremental_model_name = None
             self.state.incremental_task_type = None
 
-        metric_lines = [f"{key}: {value:.4f}" for key, value in result.metrics.items()]
-        metrics_text = "Training complete\n" + "\n".join(metric_lines)
+        metrics_text = self._build_metrics_text(result.metrics)
         figure = build_importance_figure(result.importance_df) if not result.importance_df.empty else None
+        model_name = self._build_model_entry_name(self.state.selected_model_name or "Model")
+        self.state.trained_models[model_name] = {
+            "trained_model": self.state.trained_model,
+            "feature_columns": list(self.state.feature_columns),
+            "target_column": self.state.target_column,
+            "selected_model_name": self.state.selected_model_name,
+            "task_type": self.state.task_type,
+            "metrics": dict(result.metrics),
+            "feature_importance": result.importance_df.copy(),
+            "incremental_model_bundle": self.state.incremental_model_bundle,
+            "incremental_features": list(self.state.incremental_features),
+            "incremental_target": self.state.incremental_target,
+            "incremental_model_name": self.state.incremental_model_name,
+            "incremental_task_type": self.state.incremental_task_type,
+        }
+        self.state.active_model_name = model_name
         self.training_results_changed.emit(metrics_text, figure)
-        self.trained_model_changed.emit(self.describe_trained_model())
+        self._emit_trained_models()
         self.status_changed.emit("Training complete.")
 
     def _on_train_error(self, message: str) -> None:
         self.train_button_enabled.emit(True)
-        self.train_worker = None
-        self.train_thread = None
         self.error_occurred.emit("Training error", message)
+
+    def _on_aggregate_finished(self, result_name: str, aggregated_df) -> None:
+        self.aggregate_button_enabled.emit(True)
+        self.state.dataframes[result_name] = aggregated_df
+        self._activate_dataset(result_name, aggregated_df, emit_datasets=True)
+        self.status_changed.emit(f"Created aggregated dataset: {result_name}")
+
+    def _on_aggregate_error(self, message: str) -> None:
+        self.aggregate_button_enabled.emit(True)
+        self.error_occurred.emit("Aggregate error", message)
+
+    def _on_merge_finished(self, result_name: str, merged_df) -> None:
+        self.merge_button_enabled.emit(True)
+        self.state.dataframes[result_name] = merged_df
+        self._activate_dataset(result_name, merged_df, emit_datasets=True)
+        self.status_changed.emit(f"Created merged dataset: {result_name}")
+
+    def _on_merge_error(self, message: str) -> None:
+        self.merge_button_enabled.emit(True)
+        self.error_occurred.emit("Merge error", message)
 
     def _build_result_name(self, left_name: str, right_name: str, join_type: str) -> str:
         base_name = f"Merged {join_type.title()} {Path(left_name).stem} + {Path(right_name).stem}"
-        candidate = base_name
-        suffix = 2
-        while candidate in self.state.dataframes:
-            candidate = f"{base_name}_{suffix}"
-            suffix += 1
-        return candidate
+        return self._build_unique_name(base_name, self.state.dataframes)
+
+    def _build_aggregate_result_name(self, dataset_name: str, output_name: str) -> str:
+        base_name = output_name.strip() or f"Aggregated {Path(dataset_name).stem}"
+        return self._build_unique_name(base_name, self.state.dataframes)
+
+    def _build_prediction_result_name(self) -> str:
+        active_name = self.state.active_dataset_name or "Dataset"
+        base_name = f"Predicted {Path(active_name).stem}"
+        return self._build_unique_name(base_name, self.state.dataframes)
 
     def can_continue_training(self, target: str, features: list[str], model_name: str) -> bool:
         """Return whether the current selections match a resumable incremental model."""
@@ -445,21 +761,60 @@ class AppController(QObject):
     def describe_trained_model(self) -> str:
         """Build a short summary for the left-side trained-model panel."""
         if self.state.trained_model is None:
-            return "No Trained Model"
+            return ""
         summary = [
             self.state.selected_model_name or "Model",
             f"Target: {self.state.target_column or '-'}",
             f"Features: {len(self.state.feature_columns)}",
         ]
+        if "accuracy" in self.state.metrics:
+            summary.append(f"Accuracy: {self.state.metrics['accuracy']:.4f}")
         if self.state.incremental_model_bundle is not None:
             summary.append("Incremental Ready")
         return "\n".join(summary)
 
+    def _emit_trained_models(self) -> None:
+        model_names = sorted(self.state.trained_models.keys(), key=str.casefold)
+        self.trained_models_changed.emit(model_names, self.state.active_model_name or "")
+        self.trained_model_changed.emit(self.describe_trained_model())
+
+    def _clear_active_model_state(self) -> None:
+        self.state.trained_model = None
+        self.state.metrics.clear()
+        self.state.feature_importance = None
+        self.state.feature_columns = []
+        self.state.target_column = None
+        self.state.incremental_model_bundle = None
+        self.state.incremental_features = []
+        self.state.incremental_target = None
+        self.state.incremental_model_name = None
+        self.state.incremental_task_type = None
+        self.trained_model_changed.emit("")
+
+    def _get_model_entry(self, model_name: str | None) -> dict | None:
+        if model_name:
+            return self.state.trained_models.get(model_name)
+        if self.state.active_model_name:
+            return self.state.trained_models.get(self.state.active_model_name)
+        return None
+
+    def _build_model_entry_name(self, base_name: str) -> str:
+        return self._build_unique_name(base_name.strip() or "Model", self.state.trained_models)
+
     def _build_range_dataset_name(self, dataset_name: str, time_column: str, start_text: str, end_text: str) -> str:
         base_name = dataset_name.strip() or self._default_range_dataset_name(time_column, start_text, end_text)
+        return self._build_unique_name(base_name, self.state.dataframes)
+
+    def _build_metrics_text(self, metrics: dict[str, float]) -> str:
+        if not metrics:
+            return ""
+        metric_lines = [f"{key}: {value:.4f}" for key, value in metrics.items()]
+        return "Training complete\n" + "\n".join(metric_lines)
+
+    def _build_unique_name(self, base_name: str, existing: dict) -> str:
         candidate = base_name
         suffix = 2
-        while candidate in self.state.dataframes:
+        while candidate in existing:
             candidate = f"{base_name}_{suffix}"
             suffix += 1
         return candidate
@@ -469,3 +824,31 @@ class AppController(QObject):
         start_part = start_text.strip() or "Start"
         end_part = end_text.strip() or "End"
         return f"{Path(active_name).stem} {time_column} {start_part} To {end_part}"
+
+    def _activate_dataset(self, dataset_name: str, df, emit_datasets: bool = False) -> None:
+        self.state.active_dataset_name = dataset_name
+        self._set_working_df(df)
+        if emit_datasets:
+            self._emit_datasets()
+
+    def _set_working_df(self, df, status_message: str | None = None) -> None:
+        updated_df = df.copy()
+        self.state.working_df = updated_df
+        if self.state.active_dataset_name is not None:
+            # Keep the selected loaded dataset in sync with Clean edits.
+            self.state.dataframes[self.state.active_dataset_name] = updated_df.copy()
+        self._emit_working_df()
+        if status_message:
+            self.status_changed.emit(status_message)
+
+    def _clear_train_thread(self) -> None:
+        self.train_worker = None
+        self.train_thread = None
+
+    def _clear_aggregate_thread(self) -> None:
+        self.aggregate_worker = None
+        self.aggregate_thread = None
+
+    def _clear_merge_thread(self) -> None:
+        self.merge_worker = None
+        self.merge_thread = None
